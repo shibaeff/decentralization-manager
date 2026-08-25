@@ -127,6 +127,11 @@ struct Claims {
     scope: Option<String>,
     #[serde(default)]
     roles: Option<Vec<String>>,
+    /// Auth0 rejects the reserved, non-namespaced `roles` custom claim for
+    /// custom API access tokens. The login Action therefore publishes roles
+    /// under this collision-resistant namespace.
+    #[serde(default, rename = "https://chainsafe.io/roles")]
+    auth0_roles: Option<Vec<String>>,
 }
 
 impl JwtValidator {
@@ -227,9 +232,15 @@ impl JwtValidator {
             }
         }
 
+        let mut flat_roles = claims.roles.unwrap_or_default();
+        for role in claims.auth0_roles.unwrap_or_default() {
+            if !flat_roles.contains(&role) {
+                flat_roles.push(role);
+            }
+        }
         let roles = collect_roles(
             claims.realm_access.as_ref(),
-            claims.roles.as_deref(),
+            Some(&flat_roles),
             claims.scope.as_deref(),
         );
         Ok(Principal {
@@ -625,6 +636,34 @@ mod tests {
         assert_eq!(principal.issuer, issuer);
         assert!(principal.has_role("admin"));
         assert!(principal.has_role("user"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_namespaced_auth0_roles() -> anyhow::Result<()> {
+        let (_server, validator, issuer) = setup().await;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_string());
+        let token = sign(
+            &header,
+            &json!({
+                "iss": issuer,
+                "sub": "auth0|operator",
+                "azp": "decman",
+                "exp": unix_now()? + 3600,
+                "https://chainsafe.io/roles": [
+                    "decentralization-manager-admin",
+                    "viewer"
+                ],
+            }),
+        )?;
+
+        let principal = validator
+            .validate(&token)
+            .await
+            .map_err(|e| anyhow::anyhow!("expected Auth0 token to verify: {e:?}"))?;
+        assert!(principal.has_role("decentralization-manager-admin"));
+        assert!(principal.has_role("viewer"));
         Ok(())
     }
 
