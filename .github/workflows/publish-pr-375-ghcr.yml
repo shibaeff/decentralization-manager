@@ -1,10 +1,10 @@
-name: Publish PR 375 image to GHCR
+name: Publish PR 375 and Auth0 fix image to GHCR
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - deploy/pr-375-image
+      - deploy/pr-375-auth0-image
 
 permissions:
   contents: read
@@ -53,9 +53,9 @@ jobs:
           context: ctx
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/shibaeff/decentralization-manager:pr-375-5756296
+          tags: ghcr.io/shibaeff/decentralization-manager:pr-375-auth0-416c94d
           build-args: |
-            DECPM_BUILD_VERSION=pr-375-5756296
+            DECPM_BUILD_VERSION=pr-375-auth0-416c94d
             DECPM_BUILD_TIME=${{ github.event.repository.updated_at }}
 
       - name: Record immutable image reference
