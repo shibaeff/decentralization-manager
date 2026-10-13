@@ -1,0 +1,110 @@
+name: Publish topology fix to GHCR
+
+on:
+  push:
+    branches: [chore/ci/topology-ghcr-image]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binary:
+    if: github.repository == 'shibaeff/decentralization-manager'
+    uses: ./.github/workflows/build-binary.yml
+    with:
+      profile: release
+
+  image:
+    if: github.repository == 'shibaeff/decentralization-manager'
+    name: Publish verified nonroot image
+    needs: binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dec-party-manager
+          path: ctx
+
+      - name: Prepare runtime and build identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp Dockerfile LICENSE NOTICE ctx/
+          printf '\nCOPY LICENSE NOTICE /usr/share/licenses/decentralization-manager/\n' >> ctx/Dockerfile
+          echo "tag=ghcr.io/shibaeff/decentralization-manager:topology-${GITHUB_SHA}-nonroot" >> "$GITHUB_OUTPUT"
+          echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build nonroot image
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64
+          load: true
+          tags: ${{ steps.identity.outputs.tag }}
+          build-args: |
+            BASE_TAG=nonroot
+            RUNTIME_UID=65532
+            DECPM_DIR_DEFAULT=/home/nonroot
+            DECPM_BUILD_VERSION=topology-${{ github.sha }}
+            DECPM_BUILD_TIME=${{ steps.identity.outputs.time }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/shibaeff/decentralization-manager
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Check nonroot runtime
+        env:
+          IMAGE: ${{ steps.identity.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = '65532:65532'
+          docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --network=none --tmpfs /tmp:uid=65532,gid=65532 "$IMAGE" --help
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish verified image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.identity.outputs.tag }}
+          build-args: |
+            BASE_TAG=nonroot
+            RUNTIME_UID=65532
+            DECPM_DIR_DEFAULT=/home/nonroot
+            DECPM_BUILD_VERSION=topology-${{ github.sha }}
+            DECPM_BUILD_TIME=${{ steps.identity.outputs.time }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/shibaeff/decentralization-manager
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          sbom: true
+
+      - name: Record immutable reference
+        env:
+          IMAGE: ${{ steps.identity.outputs.tag }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "$IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
