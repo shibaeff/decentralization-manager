@@ -3082,6 +3082,23 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "MIGRATOR")]
+    async fn d2_build_accepts_existing_d3_additive_schema(pool: SqlitePool) -> Result {
+        // Keep migration 20 byte-for-byte from the deployed build so sqlx
+        // accepts its recorded checksum. D2 does not use the extra column.
+        let version: (i64,) =
+            sqlx::query_as("SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(version.0, 20);
+        sqlx::query("SELECT contract_intents FROM pending_invitations")
+            .fetch_all(&pool)
+            .await?;
+        MIGRATOR.run(&pool).await?;
+        assert!(pool.get_all_pending_invitations().await?.is_empty());
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
     async fn repair_migration_checksums_unblocks_pre_edit_database(pool: SqlitePool) -> Result {
         let (version, old_checksum, _) = MIGRATION_CHECKSUM_REPAIRS[0];
 

@@ -1209,6 +1209,25 @@ mod tests {
     }
 
     #[test]
+    fn release_d2_frames_decode_and_d3_frames_are_rejected() {
+        // Literal v1.13.0 wire frame: version, type, empty routing instance,
+        // and empty payload. Do not derive the version from WIRE_VERSION.
+        for kind in [
+            MessageType::Health,
+            MessageType::RequestOwnerKeys,
+            MessageType::InviteContracts,
+        ] {
+            let mut frame = vec![0xd2];
+            frame.extend_from_slice(&kind.to_u16().to_be_bytes());
+            frame.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            let decoded = Message::from_bytes(&frame).expect("v1.13.0 peer frame");
+            assert_eq!(decoded.to_bytes(), frame);
+            frame[0] = 0xd3;
+            assert!(Message::from_bytes(&frame).is_err());
+        }
+    }
+
+    #[test]
     fn test_message_encoding_empty() {
         let msg = Message::new_empty(MessageType::UploadDars);
         let bytes = msg.to_bytes();

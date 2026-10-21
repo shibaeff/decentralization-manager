@@ -68,6 +68,9 @@ jobs:
           npm ci
           npm run build
 
+      - name: Test D2 protocol, migrations, topology and rewards backports
+        run: DECMAN_SKIP_FRONTEND=1 cargo test --locked --profile ${{ inputs.profile }} -p decman --lib
+
       # DECMAN_SKIP_FRONTEND=1 tells build.rs not to rebuild the frontend — the
       # bundle above is already in frontend/dist and rust-embed embeds it as-is.
       - name: Build binary

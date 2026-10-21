@@ -61,12 +61,12 @@ use super::event_filters::{
     interface_filter, party_event_format, template_filter, wildcard_filter,
 };
 use super::handlers::{get_party_credentials, packages};
+use super::package_inventory::fetch_package_names;
 use super::queries::resolve_contract_package_ref;
 use super::record::{
     field_decimal, field_list_len, field_optional_is_none, field_party_id, field_party_list,
     field_time,
 };
-use super::package_inventory::fetch_package_names;
 
 // ============================================================================
 // Shared decoded ACS read

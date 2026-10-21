@@ -11,6 +11,7 @@ on:
 
 jobs:
   binary:
+    if: github.repository == 'DLC-link/decentralization-manager'
     uses: ./.github/workflows/build-binary.yml
     with:
       profile: fast
