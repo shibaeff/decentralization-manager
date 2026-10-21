@@ -65,7 +65,10 @@ use super::record::{
     field_decimal, field_list_len, field_optional_is_none, field_party_id, field_party_list,
     field_time,
 };
-use super::{package_inventory::fetch_package_id_to_name, queries::fetch_contract_template_id};
+use super::{
+    package_inventory::{fetch_package_id_to_name, fetch_package_names},
+    queries::fetch_contract_template_id,
+};
 
 // ============================================================================
 // Shared decoded ACS read
@@ -1123,6 +1126,40 @@ fn canton_error_id(e: &anyhow::Error) -> Option<String> {
         .then(|| id.to_string())
 }
 
+/// The package name an alias such as `#governance-rewards-automation-v1`
+/// resolves against (pure). The Ledger API matches on the bare name; the `#`
+/// only marks the reference as a name rather than a package id.
+fn alias_package_name(alias: &str) -> &str {
+    alias.strip_prefix('#').unwrap_or(alias)
+}
+
+/// Whether `alias` names one of the packages uploaded on this participant
+/// (pure). Exact match on the name: `governance-rewards-v1` is a different
+/// lineage, not an older version of `governance-rewards-automation-v1`.
+fn holds_package(uploaded: &[String], alias: &str) -> bool {
+    let wanted = alias_package_name(alias);
+    uploaded.iter().any(|name| name == wanted)
+}
+
+/// Whether this participant has the rewards DAR uploaded, asked of the Admin
+/// PackageService rather than of the Ledger API.
+///
+/// Both ledger reads name the package by alias, and a participant without it
+/// rejects each one with `PACKAGE_NAMES_NOT_FOUND` *and logs the rejection*:
+/// two lines per decparty per sweep, forever, on a node where nothing is wrong.
+/// The listing answers the same question with no rejection to log. `None`
+/// when no rewards package is configured, so there is nothing to look for.
+async fn rewards_dar_present(
+    config: &NodeConfig,
+    packages: &PackageConfig,
+) -> anyhow::Result<Option<bool>> {
+    let Some(alias) = packages.governance_rewards.as_deref() else {
+        return Ok(None);
+    };
+    let names = fetch_package_names(config).await?;
+    Ok(Some(holds_package(&names, alias)))
+}
+
 /// Whether a read failed only because a package it names is absent from this
 /// participant.
 ///
@@ -1386,6 +1423,15 @@ pub(crate) async fn run_reward_automation_loop(data: actix_web::web::Data<AppSta
     // could read them. Kept across passes so a later credentials outage does not
     // stop the loop classifying: a set read once stays truer than no set at all.
     let mut enabled: Option<HashSet<CantonId>> = None;
+    // Whether the rewards DAR has been seen on this participant. A DAR, once
+    // uploaded, stays, so the listing is not repeated after it is found; should
+    // it be unvetted later, the ledger reads report `PACKAGE_NAMES_NOT_FOUND`
+    // and the existing `Off` handling covers it.
+    let mut dar_present = false;
+    // Whether the "off" state has been reported at `info` this process. Every
+    // later pass in the same state says it at `trace` only, as before.
+    let mut announced_off = false;
+    let pkgs = packages();
 
     loop {
         heartbeat.tick().await;
@@ -1417,24 +1463,52 @@ pub(crate) async fn run_reward_automation_loop(data: actix_web::web::Data<AppSta
 
         prune_unserved(&mut oldest, &parties);
 
+        if !dar_present {
+            match rewards_dar_present(&data.config, &pkgs).await {
+                Ok(Some(true)) | Ok(None) => {
+                    dar_present = true;
+                    if announced_off {
+                        tracing::info!(
+                            "rewards DAR found on this participant; reward automation reads resume"
+                        );
+                    }
+                }
+                Ok(Some(false)) => {
+                    if announced_off {
+                        tracing::trace!(
+                            "reward automation is off: this participant holds no rewards DAR"
+                        );
+                    } else {
+                        announced_off = true;
+                        tracing::info!(
+                            "reward automation is off: this participant holds no rewards DAR; \
+                             the ledger reads are skipped until one is uploaded"
+                        );
+                    }
+                    // The pass still happened for every decparty, with the same
+                    // outcome the rejected read would have produced, so the sweep
+                    // counters and the gauge behave exactly as before the gate.
+                    for decparty in parties {
+                        record_pass(pass, &decparty.to_string());
+                        apply_sweep_outcome(&mut oldest, &decparty, SweepOutcome::Off);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    // The listing is an optimisation over the read, not a gate
+                    // on it: a node that cannot ask falls through to the reads.
+                    tracing::warn!(error = %e, "listing participant packages failed; reading the ledger instead");
+                }
+            }
+        }
+
         if let Some(set) = read_enablement(&data, &parties).await {
             enabled = Some(set);
         }
 
         for decparty in parties {
             let label = decparty.to_string();
-            // Only a sweep moves the sweep counters. A read that fails is not a
-            // sweep that failed, and counting it would fire the sweep-failure
-            // alert on a signal-path problem.
-            match pass {
-                Pass::Sweep => {
-                    SWEEPS.with_label_values(&[&label]).inc();
-                    ensure_outcome_series(&label);
-                }
-                Pass::ExpiryRead => {
-                    EXPIRY_READS.with_label_values(&[&label]).inc();
-                }
-            }
+            record_pass(pass, &label);
             let outcome = match run_once_for_party(&data, &decparty, pass).await {
                 Ok(outcome) => outcome,
                 Err(e) if package_absent(&e) => {
@@ -1472,6 +1546,21 @@ pub(crate) async fn run_reward_automation_loop(data: actix_web::web::Data<AppSta
                 }
             }
             apply_sweep_outcome(&mut oldest, &decparty, outcome);
+        }
+    }
+}
+
+/// Moves the per-decparty pass counters for one pass. Only a sweep moves the
+/// sweep counters: a read that fails is not a sweep that failed, and counting it
+/// would fire the sweep-failure alert on a signal-path problem.
+fn record_pass(pass: Pass, label: &str) {
+    match pass {
+        Pass::Sweep => {
+            SWEEPS.with_label_values(&[label]).inc();
+            ensure_outcome_series(label);
+        }
+        Pass::ExpiryRead => {
+            EXPIRY_READS.with_label_values(&[label]).inc();
         }
     }
 }
@@ -1832,6 +1921,46 @@ mod tests {
         "carol::1220cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const DAVE: &str = "dave::1220dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const EVE: &str = "eve::1220eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+    #[test]
+    fn holds_package_matches_the_bare_alias_name_exactly() {
+        let uploaded: Vec<String> = [
+            "splice-amulet",
+            "governance-rewards-v1",
+            "governance-rewards-automation-v1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(holds_package(
+            &uploaded,
+            "#governance-rewards-automation-v1"
+        ));
+        assert!(holds_package(&uploaded, "governance-rewards-automation-v1"));
+        assert!(!holds_package(
+            &uploaded,
+            "#governance-rewards-automation-v2"
+        ));
+        // A different lineage sharing a prefix is not the package.
+        assert!(!holds_package(
+            &["governance-rewards-v1".to_string()],
+            "#governance-rewards-automation-v1"
+        ));
+        assert!(!holds_package(&[], "#governance-rewards-automation-v1"));
+    }
+
+    #[test]
+    fn alias_package_name_strips_only_the_leading_hash() {
+        assert_eq!(
+            alias_package_name("#governance-rewards-automation-v1"),
+            "governance-rewards-automation-v1"
+        );
+        assert_eq!(
+            alias_package_name("governance-rewards-automation-v1"),
+            "governance-rewards-automation-v1"
+        );
+        assert_eq!(alias_package_name("##x"), "#x");
+    }
 
     #[test]
     fn delegation_identity_rejects_lookalikes_and_missing_inventory() -> anyhow::Result<()> {
